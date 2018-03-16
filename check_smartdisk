@@ -1,0 +1,209 @@
+#!/bin/bash
+
+set -u
+
+# arrays that will be populated with the disks in critical/unknown/warning state
+critical_disks=()
+unknown_disks=()
+warning_disks=()
+
+# we will check our disks against the following
+ATTRIBUTES_OK="read-total-unc-errors;0; write-total-unc-errors;0; verify-total-unc-errors;0;"
+DEFECTS_WARN_THRESHOLD=1      # thresholds might need to be revised
+DEFECTS_CRITICAL_THRESHOLD=5  # thresholds might need to be revised
+
+# the final output message will be appended to this
+final_message=""
+
+
+
+function checkDefectList {
+  # $1 is the sdX device and $2 id the physical device id which only exists if $1 is a logical device with
+  # more than 1 physical disks. so, we first check how many arguments are passed to the function, if they 
+  # are 2, the sdX device is a logical drive else, it is a physical disk. The SMART command used as well as
+  # the message output are modified accordingly in each case
+  if [ $# -ne 2 ]; then
+    # physical device = logical device
+    MYPHYDISK=$1
+    SMARTCOMMAND="smartctl -A ${MYPHYDISK}"
+  else
+    # physical device = logical device plus slot info
+    MYPHYDISK="${1}-PHY_slot_${2}"
+    SMARTCOMMAND="smartctl -A -d megaraid,${2} ${1}"
+  fi
+  smart_defects=$(${SMARTCOMMAND} | grep defect | awk '{print $6} ')
+  if [[ ${smart_defects} ]]; then
+    if [[ ${smart_defects} -gt ${DEFECTS_CRITICAL_THRESHOLD} ]]; then
+      message="defect_list_elements: ${smart_defects}"
+      critical_disks+=(${MYPHYDISK})
+      final_message+="${MYPHYDISK}: ${message} - "
+    elif [[ ${smart_defects} -gt ${DEFECTS_WARN_THRESHOLD} ]]; then
+      message="defect_list_elements: ${smart_defects}"
+      warning_disks+=(${MYPHYDISK})
+      final_message+="${MYPHYDISK}: ${message} - "
+    fi
+  else
+    message="Device is not SMART capable/unknown"
+    unknown_disks+=(${MYPHYDISK})
+    final_message+="${MYPHYDISK}: ${message} - "
+  fi
+}
+
+
+# it is possible that $disk is a logical drive, so this function serves to associate it with
+# its physical drives that can be checked by smart
+
+function logicaltophysical {  
+  MYDEVLOCAL=$1
+  # find logical targets from megacli and then connect each logical target with the relevant device targets
+  MegaCli -LDInfo -Lall -aALL -NoLog | grep "Virtual Drive:" | awk '{ print $3 " " $6 }' | tr -d ')' > /tmp/logical_targets
+  while read line; do
+   targetId=$(awk '{ print $2 }' /tmp/logical_targets);
+   dev=$(ls -l /dev/disk/by-path/ | grep -E "scsi-[0-9]:[0-9]:${targetId}:[0-9] " | awk '{print($11)}');
+   echo "${dev##*\/} ${targetId}">> /tmp/device_target
+  done < /tmp/logical_targets
+  
+  # find the virtual drive that is actually the $disk (device) of this iteration - very useful if more than 1 logical drives
+  # then, find the relevant device IDs of the physical disks from megacli
+  virtual_drive=$(grep "${MYDEVLOCAL}" /tmp/device_target | awk '{ print $2 }')
+  MegaCli -LdPdInfo -a"${virtual_drive}" -NoLog | grep "Device Id:" | awk '{ print $NF }' > /tmp/megacli_extradeviceids
+}
+
+function megaraidchecks {
+  logicalDev=$1
+  deviceid=$2
+  # for each device ID (= physical disk) perform the rest of the checks: extract attribute_file name, check SMART attributes
+  # and the elements in grown defect list
+  # append the PHY_slot in the output as /dev/sdX megaraid,29 is different physical disk than /dev/sdX megaraid,30
+  vendor_product_serial=$(smartctl -i -d megaraid,"${deviceid}" "${logicalDev}" | grep -E '^(Vendor|Product|Serial)' | grep -oE '[^ ]+$' | paste -sd'-')
+  attributes_file="/var/lib/smartmontools/attrlog.${vendor_product_serial}.scsi.csv"
+  attributes=$(tail -n1 "${attributes_file}" | awk '{print $9, $16, $23}')
+  if [[ "${attributes}" == "${ATTRIBUTES_OK}" ]]; then
+    # check SMART disk elements in grown defect list
+    checkDefectList ${logicalDev} ${deviceid}
+  else
+    message="SMART_attributes ${attributes}"
+    critical_disks+=(${logicalDev}-PHY_slot_${deviceid})
+    final_message+="${logicalDev}-PHY_slot_${deviceid}: ${message} - "
+  fi
+}
+
+function removetempfiles {
+  rm -f /tmp/logical_targets
+  rm -f /tmp/device_target
+  rm -f /tmp/megacli_extradeviceids
+}
+
+# extract the list of all devices "sdX" and iterate for each of them
+for MYDEV in $(lsblk -S -n | grep -Ev '(iscsi)' | awk '{print $1}'); do 
+
+  # Check SMART Health Status for all disks
+  disk="/dev/${MYDEV}"
+  smart_health=$(smartctl -H "${disk}" | grep Status | awk '{print $4}')
+
+  if [[ -z "${smart_health}" ]]; then
+    # if $smart_health doesn't exist it's possible that $disk is a logical device failing to open with
+    # smartctl and we need to add '-d megaraid,N' (e.g DELL or MegaRaid controller). so, we have to find 
+    # logical targets from megacli and then connect each logical target with the relevant device targets
+    # this is what function 'logicaltoplysical' does
+
+    logicaltophysical ${MYDEV}
+    
+    # now that we can 'talk smart' to the device, let's check smart_health as well as the rest of our checks
+    while read extradeviceid; do
+      smart_health=$(smartctl -H -d megaraid,"${extradeviceid}" "${disk}" | grep Status | awk '{print $4}')
+      
+      if [[ "${smart_health}" == "OK" ]]; then
+        # if health is ok then, proceed to check SMART disk attributes and grown defects list 
+        # use 'megaraidchecks' function that 'talks smart properly' to the devices
+        megaraidchecks ${disk} ${extradeviceid}
+      elif [[ "${smart_health}" != "OK" ]]; then
+        message="health ${smart_health}"
+        critical_disks+=(${disk}-PHY_slot_${extradeviceid})
+        final_message+="${disk}-PHY_slot_${extradeviceid}: ${message} - "
+      # if $smart_health doesn't exist, then SMART check should return unknown
+      else
+        message="Device is not SMART capable/unknown"
+        unknown_disks+=(${disk}-PHY_slot_${extradeviceid})
+        final_message+="${disk}-PHY_slot_${extradeviceid}: ${message} - "
+      fi
+      
+    done < /tmp/megacli_extradeviceids
+
+    # after we are done with this logical drive, remove the temp files
+    removetempfiles
+
+  elif [[ "${smart_health}" == "OK" ]]; then
+    # proceed to check SMART disk attributes
+    vendor_product_serial=$(smartctl -i "${disk}" | grep -E '^(Vendor|Product|Serial)' | grep -oE '[^ ]+$' | paste -sd'-')
+    attributes_file="/var/lib/smartmontools/attrlog.${vendor_product_serial}.scsi.csv"
+    
+    if [[ ! -f ${attributes_file} ]]; then
+      # if disk doesn't have $attributes_file then it is possible that $disk is a logical drive, let's find its physical drives
+      # this is what function 'logicaltoplysical' does
+      logicaltophysical ${MYDEV}
+
+      # since we connected logical to physical, let's proceed to the rest of the tests with smartctl using megaraid input
+      # this is what function 'megaraidchecks' does
+      while read extradeviceid; do
+        megaraidchecks ${disk} ${extradeviceid}
+      done < /tmp/megacli_extradeviceids
+
+      # after we are done with this logical drive, remove the temp files
+      removetempfiles
+
+    else
+      # if disk has $attributes_file then the device represents 1 physical disk so we proceed with the rest of the checks:
+      # check SMART attributes and the elements in grown defect list
+      attributes=$(tail -n1 "${attributes_file}" | awk '{print $9, $16, $23}')
+      if [[ "${attributes}" == "${ATTRIBUTES_OK}" ]]; then
+        # check SMART disk elements in grown defect list
+        checkDefectList ${disk}
+      else
+        message="SMART_attributes ${attributes}"
+        critical_disks+=(${disk})
+        final_message+="${disk}: ${message} - "
+      fi
+
+    fi
+
+  # else (= if $smart_health not ok) then disk is critical
+  else
+    message="health ${smart_health}"
+    critical_disks+=(${disk})
+    final_message+="${disk}: ${message} - "
+  fi
+
+done
+
+
+# if the critical_disks array is populated, then our status is critical
+if [[ ${#critical_disks[@]} -gt 0 ]]; then
+  final_status="CRITICAL"
+  final_code=2  
+# else if the warning_disks array is populated, then our status is warning
+elif [[ ${#warning_disks[@]} -gt 0 ]]; then
+  final_status="WARNING"
+  final_code=1  
+# else if the unknown_disks array is populated, then our status is unknown
+elif [[ ${#unknown_disks[@]} -gt 0 ]]; then
+  final_status="UNKNOWN"
+  final_code=3  
+# else if none of the arrays is populated, then our status is OK
+else
+  final_status="OK"
+  final_code=0  
+fi
+
+
+# if there is a non-empty $final_message, cut the last " - " and return it
+if [[ ${final_message} ]]; then
+  final_message=$(echo "${final_message}" | rev | cut -c3- | rev)
+# else if $final_message is empty, then all disks are ok (during the iterations
+# only the problems are appended to the final_message)
+else
+  final_message="All disks are healthy"
+fi
+
+# return status code, status and final_message
+echo "${final_code} Disks_SMART_check - ${final_status} - ${final_message}"
